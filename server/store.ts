@@ -18,6 +18,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS imports (id TEXT PRIMARY KEY, sha TEXT UNIQUE NOT NULL, name TEXT NOT NULL, created TEXT NOT NULL, stats TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', target TEXT, candidates TEXT NOT NULL DEFAULT '[]', reason TEXT);
+      CREATE INDEX IF NOT EXISTS entity_kind ON entities(kind);
+      CREATE INDEX IF NOT EXISTS entity_status ON entities(status);
       CREATE TABLE IF NOT EXISTS collections (id TEXT PRIMARY KEY, source_key TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS entries (collection_id TEXT REFERENCES collections(id) ON DELETE CASCADE, position INTEGER NOT NULL, entity_id TEXT REFERENCES entities(id), PRIMARY KEY(collection_id,position));
       CREATE TABLE IF NOT EXISTS history (id TEXT PRIMARY KEY, entity_id TEXT REFERENCES entities(id), played_at TEXT NOT NULL, ms_played INTEGER NOT NULL, skipped INTEGER NOT NULL, source TEXT NOT NULL);

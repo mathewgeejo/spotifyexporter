@@ -1,0 +1,20 @@
+services:
+  encore:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8080}:8080"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATA_DIR: /app/data
+      APP_URL: ${APP_URL:-http://127.0.0.1:8080}
+      SECURE_COOKIES: ${SECURE_COOKIES:-false}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:8080/api/connections/spotify/callback}
+    volumes:
+      - encore-data:/app/data
+    stop_grace_period: 40s
+volumes:
+  encore-data:

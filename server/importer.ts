@@ -4,7 +4,7 @@ import { basename, join, posix } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
-import { JSONParser } from '@streamparser/json-node';
+import { JSONParser } from '@streamparser/json';
 import yauzl from 'yauzl';
 import { Store, hash, now } from './store.js';
 import type { SourceEntity } from '../shared/types.js';
@@ -16,20 +16,22 @@ const artistNames = (value: any): string[] => Array.isArray(value) ? value.map(v
 
 export function parseSong(raw: any, flags: Partial<SourceEntity> = {}): Omit<SourceEntity, 'id'> | undefined {
   if (!raw || typeof raw !== 'object') return;
-  const value = raw.track || raw.item || raw;
+  const value = raw.track && typeof raw.track === 'object' ? raw.track : raw.item && typeof raw.item === 'object' ? raw.item : raw.localTrack && typeof raw.localTrack === 'object' ? raw.localTrack : raw;
   if (value.type === 'episode' || value.episodeName || value.episode_name) return;
-  const name = text(value.trackName || value.track || value.name || value.master_metadata_track_name);
+  const name = text(value.trackName || value.track || value.name || value.master_metadata_track_name || value.localTrackName || raw.localTrackName);
   const artists = artistNames(value.artists || value.artistName || value.artist || value.master_metadata_album_artist_name);
-  if (!name || !artists.length) return;
+  const local = !!(raw.localTrack || value.is_local || value.localTrack || value.localTrackName || raw.localTrackName || String(value.uri || value.trackUri || '').startsWith('spotify:local:'));
+  if (!name || (!artists.length && !local)) return;
   const album = text(typeof value.album === 'object' ? value.album?.name : value.album || value.albumName || value.master_metadata_album_album_name);
   return { kind: 'song', name, artists, album: album || undefined, uri: text(value.uri || value.trackUri || value.spotify_track_uri) || undefined,
     durationMs: Number.isFinite(value.duration_ms) ? value.duration_ms : undefined,
     explicit: typeof value.explicit === 'boolean' ? value.explicit : undefined,
-    local: !!(value.is_local || value.localTrack || value.localTrackName || String(value.uri || value.trackUri || '').startsWith('spotify:local:')), ...flags };
+    local, ...flags };
 }
 
 export async function importJson(path: string, filename: string, fileHash: string, store: Store): Promise<ImportStats> {
-  const stats = blank(); let playlistIndex = 0; let seen = 0; const eventOccurrences = new Map<string, number>();
+  const stats = blank(); let playlistIndex = 0; let seen = 0;
+  store.db.exec('CREATE TEMP TABLE IF NOT EXISTS event_occurrences (signature TEXT PRIMARY KEY, occurrence INTEGER NOT NULL); DELETE FROM event_occurrences;');
   const handle = await openFile(path, 'r'); const prefix = Buffer.alloc(2048);
   await handle.read(prefix, 0, prefix.length, 0); await handle.close();
   const topArray = prefix.toString('utf8').replace(/^\uFEFF/, '').trimStart().startsWith('[');
@@ -45,43 +47,48 @@ export async function importJson(path: string, filename: string, fileHash: strin
         if (!song || !Number.isFinite(timestamp) || !Number.isFinite(ms) || ms < 0) { stats.skipped++; continue; }
         const entityId = store.entity(song); const playedAt = new Date(timestamp).toISOString();
         const signature = hash(JSON.stringify([song.uri || [song.name, song.artists, song.album], playedAt, ms, !!raw.skipped]));
-        const occurrence = eventOccurrences.get(signature) || 0; eventOccurrences.set(signature, occurrence + 1);
+        const occurrence = store.get('INSERT INTO event_occurrences VALUES (?,0) ON CONFLICT(signature) DO UPDATE SET occurrence=occurrence+1 RETURNING occurrence', signature)!.occurrence;
         store.run('INSERT OR IGNORE INTO history VALUES (?,?,?,?,?,?)', hash(`${signature}:${occurrence}`), entityId, playedAt, Math.floor(ms), raw.skipped === true ? 1 : 0, filename);
         stats.history++;
       }
     });
     historyBatch.length = 0;
   }
-  await pipeline(createReadStream(path), parser, async source => {
-    for await (const event of source) {
-      const raw = event.value; const category = topArray ? '' : String(event.stack[1]?.key || ''); seen++;
+  parser.onValue = event => {
+      const raw: any = event.value; const category = topArray ? '' : String(event.stack[1]?.key || ''); seen++;
       if (raw && typeof raw === 'object' && ('ms_played' in raw || 'msPlayed' in raw)) {
-        historyBatch.push({ raw, index: seen }); if (historyBatch.length >= 500) flushHistory(); continue;
+        historyBatch.push({ raw, index: seen }); if (historyBatch.length >= 500) flushHistory(); return;
       }
       if (category === 'playlists' || (raw && Array.isArray(raw.items) && typeof raw.name === 'string')) {
+        if (!raw || typeof raw !== 'object' || !Array.isArray(raw.items || raw.tracks?.items)) { stats.skipped++; return; }
         const items: string[] = [];
         for (const item of raw.items || raw.tracks?.items || []) {
           const song = parseSong(item);
           if (song) items.push(store.entity(song)); else stats.skipped++;
         }
         store.collection(`archive:${fileHash}:${playlistIndex++}`, { name: text(raw.name) || 'Untitled playlist', description: text(raw.description), sourceUri: text(raw.uri) || undefined }, items);
-        stats.playlists++; continue;
+        stats.playlists++; return;
       }
       if (category === 'albums') {
         const value = raw?.album && typeof raw.album === 'object' ? raw.album : raw;
         const name = text(value?.name || value?.album); const artists = artistNames(value?.artists || value?.artist);
-        if (!name || !artists.length) { stats.skipped++; continue; }
-        store.entity({ kind: 'album', name, artists, uri: text(value.uri) || undefined, saved: true }); stats.albums++; continue;
+        if (!name || !artists.length) { stats.skipped++; return; }
+        store.entity({ kind: 'album', name, artists, uri: text(value.uri) || undefined, saved: true }); stats.albums++; return;
       }
       if (category === 'artists' || category === 'followingArtists') {
         const name = text(typeof raw === 'string' ? raw : raw?.name || raw?.artist);
-        if (!name) { stats.skipped++; continue; }
-        store.entity({ kind: 'artist', name, artists: [name], uri: text(raw?.uri) || undefined, followed: true }); stats.artists++; continue;
+        if (!name) { stats.skipped++; return; }
+        store.entity({ kind: 'artist', name, artists: [name], uri: text(raw?.uri) || undefined, followed: true }); stats.artists++; return;
       }
       const song = parseSong(raw, { liked: true, saved: true });
       if (song) { store.entity(song); stats.songs++; } else stats.skipped++;
-    }
-  });
+  };
+  let firstChunk = true;
+  for await (const chunk of createReadStream(path)) {
+    const bytes = firstChunk && chunk[0] === 0xef && chunk[1] === 0xbb && chunk[2] === 0xbf ? chunk.subarray(3) : chunk;
+    firstChunk = false; parser.write(bytes);
+  }
+  if (!parser.isEnded) parser.end();
   flushHistory();
   if (!seen) stats.warnings.push(`${filename}: no supported music records found.`);
   if (stats.skipped) stats.warnings.push(`${filename}: ${stats.skipped} unsupported or incomplete records skipped (including podcasts).`);

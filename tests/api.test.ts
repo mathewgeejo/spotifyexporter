@@ -1,0 +1,51 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { createApp, csvRow } from '../server/app.js';
+import { FakeMusic, temporaryDirectory } from './helpers.js';
+
+test('owner authentication, CSRF, encrypted credentials, pagination, history qualification, and exports', async () => {
+  const temp = await temporaryDirectory(); const provider = new FakeMusic(); const { app, store, vault } = await createApp({ dataDir: temp.directory, providerFactory: async () => provider, startWorker: false });
+  try {
+    for (const url of ['/api/overview', '/api/connections', '/api/library/entities', '/api/history', '/api/jobs', '/api/export', '/api/docs/json']) assert.equal((await app.inject({ url })).statusCode, 401, url);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'short' } })).statusCode, 400);
+    const setup = await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'a secure owner password' } }); assert.equal(setup.statusCode, 200);
+    const cookie = String(setup.headers['set-cookie']).split(';')[0]; const csrf = setup.json().csrf; const headers = { cookie, 'x-csrf-token': csrf };
+    assert.match(String(setup.headers['set-cookie']), /HttpOnly/); assert.match(String(setup.headers['set-cookie']), /SameSite=Lax/i);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/matches', headers: { cookie }, payload: {} })).statusCode, 403);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/login', headers: { origin: 'https://evil.example' }, payload: { password: 'a secure owner password' } })).statusCode, 403);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'another owner password' } })).statusCode, 409);
+    vault.set('youtube', { cookie: 'TOP_SECRET_COOKIE', identity: '@owner', account: 'Owner' });
+    assert.doesNotMatch(store.setting('secret:youtube')!, /TOP_SECRET_COOKIE/);
+    const connection = await app.inject({ url: '/api/connections', headers }); assert.doesNotMatch(connection.body, /TOP_SECRET_COOKIE/);
+    for (let i = 0; i < 42; i++) store.entity({ kind: 'song', name: `Song ${String(i).padStart(2, '0')}`, artists: ['Artist'], saved: true, liked: true });
+    const page = await app.inject({ url: '/api/library/entities?kind=song&page=2&pageSize=20', headers }); assert.equal(page.json().total, 42); assert.equal(page.json().items.length, 20); assert.equal(page.json().items[0].name, 'Song 20');
+    const id = store.all('SELECT id FROM entities')[0].id;
+    for (const [index, ms, skipped] of [[0, 60000, 0], [1, 10000, 0], [2, 120000, 1]]) store.run('INSERT INTO history VALUES (?,?,?,?,?,?)', `event-${index}`, id, `2024-01-0${index + 1}T12:00:00.000Z`, ms, skipped, 'test');
+    const top = await app.inject({ url: '/api/history/favorites', headers }); assert.equal(top.json()[0].milliseconds, 60000); assert.equal(top.json()[0].plays, 1);
+    const history = await app.inject({ url: '/api/history?from=2024-01-02&to=2024-01-02', headers }); assert.equal(history.json().total, 1);
+    const exportResponse = await app.inject({ url: '/api/export?format=json', headers }); assert.equal(exportResponse.statusCode, 200); assert.doesNotMatch(exportResponse.body, /TOP_SECRET_COOKIE|secret:|owner-password/); assert.equal(exportResponse.json().entities.length, 42);
+    assert.equal((await app.inject({ url: '/api/docs/json', headers })).statusCode, 200);
+    const boundary = 'encore-test-boundary';
+    const file = JSON.stringify({ playlists: [{ name: 'Uploaded playlist', items: [{ track: { trackName: 'Uploaded song', artistName: 'Artist', trackUri: 'spotify:track:uploaded' } }] }] });
+    const multipart = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="Playlist.json"\r\nContent-Type: application/json\r\n\r\n${file}\r\n--${boundary}--\r\n`;
+    const uploaded = await app.inject({ method: 'POST', url: '/api/imports', headers: { ...headers, 'content-type': `multipart/form-data; boundary=${boundary}` }, payload: Buffer.from(multipart) });
+    assert.equal(uploaded.statusCode, 200, uploaded.body); assert.equal(uploaded.json().stats.playlists, 1);
+    const library = await app.inject({ url: '/api/library/collections', headers }); const playlist = library.json()[0];
+    const selection = { collectionIds: [playlist.id], likes: false, songs: false, albums: false, artists: false, favoriteIds: [] };
+    const matchJob = await app.inject({ method: 'POST', url: '/api/matches', headers, payload: selection }); assert.equal(matchJob.statusCode, 200);
+    assert.equal((await app.inject({ method: 'POST', url: `/api/jobs/${matchJob.json().id}/pause`, headers })).json().status, 'paused');
+    assert.equal((await app.inject({ method: 'POST', url: `/api/jobs/${matchJob.json().id}/resume`, headers })).json().status, 'queued');
+    assert.equal((await app.inject({ method: 'POST', url: `/api/jobs/${matchJob.json().id}/cancel`, headers })).json().status, 'cancelled');
+    const sourceId = store.all('SELECT entity_id FROM entries WHERE collection_id=?', playlist.id)[0].entity_id;
+    const target = { id: 'chosen', name: 'Uploaded song', artists: ['Artist'], url: 'https://music.youtube.com/watch?v=chosen' };
+    store.run('UPDATE entities SET candidates=? WHERE id=?', JSON.stringify([target]), sourceId);
+    assert.equal((await app.inject({ method: 'PATCH', url: `/api/matches/${sourceId}`, headers, payload: { action: 'approve', candidateId: 'chosen' } })).statusCode, 200);
+    const transfer = await app.inject({ method: 'POST', url: '/api/transfers', headers, payload: selection }); assert.equal(transfer.statusCode, 200);
+    const report = await app.inject({ url: `/api/jobs/${transfer.json().id}/report?format=json`, headers }); assert.equal(report.json().items.length, 2);
+    assert.equal((await app.inject({ method: 'DELETE', url: '/api/data', headers, payload: { confirmation: 'DELETE MY IMPORTED DATA' } })).statusCode, 409);
+    await app.inject({ method: 'POST', url: `/api/jobs/${transfer.json().id}/cancel`, headers });
+    assert.equal(csvRow(['=IMPORTDATA("evil")']).startsWith('"\'=IMPORTDATA'), true);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/logout', headers })).statusCode, 200);
+    assert.equal((await app.inject({ url: '/api/overview', headers })).statusCode, 401);
+  } finally { await app.close(); await temp.cleanup(); }
+});

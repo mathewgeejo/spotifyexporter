@@ -60,9 +60,9 @@ export class YouTubeAdapter implements MusicProvider {
       return { adapter: new YouTubeAdapter(client, identity, account), credentials: { cookie, accountIndex, channelId, account, identity } };
     } catch (error) { throw safeError(error); }
   }
-  private async request(path: string, body: any) {
+  private async request(path: string, body: Record<string, unknown>) {
     try {
-      const response = await this.client.actions.execute(path, { ...body, client: 'YTMUSIC' });
+      const response = await this.client.actions.execute(path, { ...body, client: 'YTMUSIC', parse: false });
       if (!response.success || response.data?.error) throw new ProviderError('YouTube rejected the requested operation.', response.status_code || 502);
       return response.data as any;
     } catch (error) { throw safeError(error); }
@@ -75,9 +75,10 @@ export class YouTubeAdapter implements MusicProvider {
         if (item.item_type !== kind) continue;
         const name = typeof item.title === 'string' ? item.title : item.title?.toString() || item.name;
         if (!name || !item.id) continue;
+        const badges = Array.isArray(item.badges) ? item.badges : item.badges?.array?.() || [];
         unique.set(item.id, { id: item.id, name, artists: kind === 'artist' ? [name] : (item.artists || item.authors || []).map((a: any) => a.name),
           album: item.album?.name, durationMs: item.duration?.seconds ? item.duration.seconds * 1000 : undefined,
-          explicit: item.badges?.some((b: any) => b.icon_type === 'MUSIC_EXPLICIT_BADGE'), available: true,
+          explicit: item.badges ? badges.some((b: any) => b.icon_type === 'MUSIC_EXPLICIT_BADGE') : undefined, available: true,
           url: kind === 'song' ? `https://music.youtube.com/watch?v=${encodeURIComponent(item.id)}` : `https://music.youtube.com/browse/${encodeURIComponent(item.id)}` });
       }
       return [...unique.values()].slice(0, 20);
@@ -92,7 +93,7 @@ export class YouTubeAdapter implements MusicProvider {
         for (const item of nodes(library.contents)) {
           if (item.item_type !== 'playlist') continue;
           const playlist: any = await this.client.music.getPlaylist(item.id);
-          if (find(playlist.header, value => typeof value.text === 'string' && value.text.includes(marker)) || find(playlist.header, value => typeof value.description === 'string' && value.description.includes(marker))) matches.push(item.id);
+          if (find(playlist.header, value => typeof value.text === 'string' && value.text.includes(marker)) || find(playlist.header, value => typeof value.description === 'string' && value.description.includes(marker))) matches.push(item.id.replace(/^VL/, ''));
         }
         if (!library.has_continuation) break;
         library = await library.getContinuation();
@@ -130,9 +131,9 @@ export class YouTubeAdapter implements MusicProvider {
       const item = nodes(results.contents).find(item => item.id === candidate.id);
       if (!item) throw new ProviderError('The matched song is no longer available in Music search.', 404);
       const menu = item.menu?.items || [];
-      const already = menu.find((node: any) => /remove from (your )?library/i.test(node.text?.toString() || ''));
+      const already = menu.find((node: any) => /remove from (your )?library/i.test(node.text?.toString() || '') || node.icon_type === 'LIBRARY_REMOVE');
       if (already) return;
-      const add = menu.find((node: any) => /add to (your )?library|save to (your )?library/i.test(node.text?.toString() || ''));
+      const add = menu.find((node: any) => /add to (your )?library|save to (your )?library/i.test(node.text?.toString() || '') || node.icon_type === 'LIBRARY_ADD');
       const endpoint = add?.default_endpoint || add?.endpoint;
       if (!endpoint) throw new ProviderError('YouTube did not provide an Add to library action for this recording.', 422);
       const response = await endpoint.call(this.client.actions, { client: 'YTMUSIC' });
@@ -142,8 +143,8 @@ export class YouTubeAdapter implements MusicProvider {
   async saveAlbum(id: string) {
     try {
       const album: any = await this.client.music.getAlbum(id);
-      const add = find(album.header, node => /add to (your )?library|save to (your )?library/i.test(node.text?.toString?.() || ''));
-      if (find(album.header, node => /remove from (your )?library/i.test(node.text?.toString?.() || ''))) return;
+      const add = find(album.header, node => /add to (your )?library|save to (your )?library/i.test(node.text?.toString?.() || node.tooltip || '') || node.icon_type === 'LIBRARY_ADD');
+      if (add?.is_toggled || find(album.header, node => /remove from (your )?library/i.test(node.text?.toString?.() || node.tooltip || '') || node.icon_type === 'LIBRARY_REMOVE')) return;
       const endpoint = add?.default_endpoint || add?.endpoint || add?.default_service_endpoint;
       if (!endpoint) throw new ProviderError('YouTube did not provide an Add to library action for this album.', 422);
       const response = await endpoint.call(this.client.actions, { client: 'YTMUSIC' });
@@ -153,9 +154,9 @@ export class YouTubeAdapter implements MusicProvider {
   async followArtist(id: string) {
     try {
       const artist: any = await this.client.music.getArtist(id);
-      const button = find(artist.header, node => node.type === 'SubscribeButton' && node.channel_id);
+      const button = find(artist.header, node => ['SubscribeButton', 'SubscribeButtonView'].includes(node.type) && node.channel_id);
       if (!button) throw new ProviderError('YouTube did not provide an artist subscription action.', 422);
-      if (button.subscribed) return;
+      if (button.subscribed || button.subscribe_button_content?.subscribe_state_subscribed) return;
       await this.request('/subscription/subscribe', { channelIds: [button.channel_id] });
     } catch (error) { throw safeError(error); }
   }
