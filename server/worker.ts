@@ -1,4 +1,4 @@
-import type { EntityView, TransferSelection } from '../shared/types.js';
+import type { Collection, EntityView, TransferSelection } from '../shared/types.js';
 import { Store, hash } from './store.js';
 import { chooseMatch } from './matching.js';
 import { ProviderError, ReviewRequired, type MusicProvider } from './youtube.js';
@@ -15,23 +15,54 @@ export function selectedEntities(store: Store, selection: TransferSelection): st
   for (const row of library) ids.add(row.id);
   return [...ids];
 }
-export function createTransfer(store: Store, selection: TransferSelection, account: string) {
-  const entities = selectedEntities(store, selection).map(id => store.getEntity(id));
-  if (entities.some(e => !e)) throw new Error('A selected source record no longer exists.');
-  const unresolved = entities.filter(e => e && !['matched', 'skipped'].includes(e.matchStatus));
-  if (unresolved.length) throw new Error(`Review or explicitly skip ${unresolved.length} unresolved matches before transferring.`);
-  const steps: { kind: string; sourceId: string }[] = []; const sequences: Record<string, string[]> = {};
-  for (const collectionId of selection.collectionIds) {
-    const collection = store.collections().find(c => c.id === collectionId);
+interface TransferSnapshot { entityIds: string[]; collections: { collection: Collection; entries: string[] }[] }
+function snapshotSelection(store: Store, selection: TransferSelection): TransferSnapshot {
+  const entityIds = selectedEntities(store, selection);
+  if (entityIds.some(id => !store.getEntity(id))) throw new Error('A selected source record no longer exists.');
+  const collections = selection.collectionIds.map(id => {
+    const collection = store.collections().find(item => item.id === id);
     if (!collection) throw new Error('A selected playlist no longer exists.');
     if (collection.inaccessible) throw new Error(`Upload archive contents for "${collection.name}" or deselect it.`);
+    return { collection, entries: store.all('SELECT entity_id FROM entries WHERE collection_id=? ORDER BY position', id).map(row => row.entity_id as string) };
+  });
+  if (!entityIds.length && !collections.length) throw new Error('Select at least one playlist or library item.');
+  return { entityIds, collections };
+}
+
+export function queueTransfer(store: Store, selection: TransferSelection, account: string) {
+  const snapshot = snapshotSelection(store, selection);
+  const pending: string[] = [];
+  // Existing review candidates can be resolved immediately without another catalog request.
+  store.transaction(() => {
+    for (const id of snapshot.entityIds) {
+      const entity = store.getEntity(id)!;
+      if (['matched', 'skipped'].includes(entity.matchStatus)) continue;
+      if (!entity.local && !entity.candidates.length && entity.matchStatus !== 'missing') { pending.push(id); continue; }
+      const result = chooseMatch(entity, entity.candidates);
+      store.run('UPDATE entities SET status=?,target=?,candidates=?,reason=? WHERE id=?', result.status, result.target ? JSON.stringify(result.target) : null, JSON.stringify(result.candidates), result.reason, id);
+    }
+  });
+  if (!pending.length) return createTransfer(store, selection, account, { snapshot });
+  const job = store.job('match', { account, transferSelection: selection, transferSnapshot: snapshot }, pending.map(sourceId => ({ kind: 'match', sourceId })));
+  store.updateJob(job.id, 'queued', 'Finding the best matches. Your transfer will start automatically.');
+  return store.getJob(job.id)!;
+}
+
+export function createTransfer(store: Store, selection: TransferSelection, account: string, options: { snapshot?: TransferSnapshot; sourceMatchJobId?: string } = {}) {
+  const snapshot = options.snapshot || snapshotSelection(store, selection);
+  const entities = snapshot.entityIds.map(id => store.getEntity(id));
+  if (entities.some(e => !e)) throw new Error('A selected source record no longer exists.');
+  const unresolved = entities.filter(e => e && !['matched', 'skipped'].includes(e.matchStatus));
+  if (unresolved.length) throw new Error(`Matching has not finished for ${unresolved.length} items. Retry the failed searches before continuing.`);
+  const steps: { kind: string; sourceId: string }[] = []; const sequences: Record<string, string[]> = {};
+  for (const { collection, entries } of snapshot.collections) {
+    const collectionId = collection.id;
     steps.push({ kind: 'playlist', sourceId: JSON.stringify(collection) });
-    const entries = store.all('SELECT entity_id,position FROM entries WHERE collection_id=? ORDER BY position', collectionId);
     sequences[collectionId] = []; let destinationIndex = 0;
-    for (const entry of entries) {
-      const entity = store.getEntity(entry.entity_id)!;
+    for (const [position, entityId] of entries.entries()) {
+      const entity = store.getEntity(entityId)!;
       if (entity.matchStatus === 'matched') sequences[collectionId].push(entity.target!.id);
-      steps.push({ kind: 'playlist_item', sourceId: JSON.stringify({ collectionId, position: entry.position, destinationIndex: entity.matchStatus === 'matched' ? destinationIndex++ : -1, entity }) });
+      steps.push({ kind: 'playlist_item', sourceId: JSON.stringify({ collectionId, position, destinationIndex: entity.matchStatus === 'matched' ? destinationIndex++ : -1, entity }) });
     }
   }
   const favorites = new Set(selection.favoriteIds);
@@ -45,7 +76,7 @@ export function createTransfer(store: Store, selection: TransferSelection, accou
     if (entity.kind === kind && (kind === 'album' ? selection.albums && entity.saved : selection.artists && entity.followed)) steps.push({ kind, sourceId: JSON.stringify(entity) });
   }
   if (!steps.length) throw new Error('Select at least one playlist or library item.');
-  return store.job('transfer', { selection, account, sequences }, steps);
+  return store.job('transfer', { selection, account, sequences, ...(options.sourceMatchJobId ? { sourceMatchJobId: options.sourceMatchJobId } : {}) }, steps);
 }
 const equal = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => b[index] === value);
 export function reconcilePlaylist(actual: string[], desired: string[], confirmed: string[]): number {
@@ -95,18 +126,33 @@ export class Worker {
       if (!payload.account) { payload.account = provider.identity; this.store.run('UPDATE jobs SET payload=? WHERE id=?', JSON.stringify(payload), row.id); }
       while (true) {
         this.check(row.id); const step = this.store.get("SELECT * FROM steps WHERE job_id=? AND status='pending' ORDER BY seq LIMIT 1", row.id); if (!step) break;
+        let cooldown = 250;
         try {
-          if (row.kind === 'match') await this.match(row.id, step, provider);
+          if (row.kind === 'match') cooldown = await this.match(row.id, step, provider) ? 250 : 0;
           else if (step.kind === 'playlist_item') await this.playlistItems(row.id, step, provider, payload);
           else await this.transferStep(row.id, step, provider);
         } catch (error) {
           if (error instanceof ReviewRequired || error instanceof Stopped || (error instanceof ProviderError && [401, 403, 429].includes(error.status))) throw error;
           this.store.stepResult(row.id, step.seq, 'failed', error instanceof ProviderError ? error.message : 'This item could not be processed. Retry it from the transfer report.');
         }
-        await this.wait(row.id, 250);
+        if (cooldown) await this.wait(row.id, cooldown);
       }
       const job = this.store.getJob(row.id)!;
-      this.store.updateJob(row.id, job.failed || job.skipped ? 'completed_with_issues' : 'completed', row.kind === 'match' ? 'Matching finished. Review uncertain items before transferring.' : 'Transfer finished. Open the report for destination links and item outcomes.');
+      if (row.kind === 'match' && payload.transferSelection) {
+        if (job.failed) {
+          this.store.updateJob(row.id, 'completed_with_issues', 'Some catalog searches failed. Retry failed items to start your transfer automatically.');
+          return;
+        }
+        this.check(row.id);
+        // A restart between queuing the transfer and completing this job must not queue it twice.
+        const existing = this.store.get("SELECT id FROM jobs WHERE kind='transfer' AND json_extract(payload,'$.sourceMatchJobId')=?", row.id);
+        const transfer = existing || createTransfer(this.store, payload.transferSelection, provider.identity, { snapshot: payload.transferSnapshot, sourceMatchJobId: row.id });
+        payload.transferJobId = transfer.id;
+        this.store.run('UPDATE jobs SET payload=? WHERE id=?', JSON.stringify(payload), row.id);
+        this.store.updateJob(row.id, job.skipped ? 'completed_with_issues' : 'completed', 'Best matches selected. Your transfer is queued automatically.');
+        return;
+      }
+      this.store.updateJob(row.id, job.failed || job.skipped ? 'completed_with_issues' : 'completed', row.kind === 'match' ? 'Best matches selected. Ready to transfer.' : 'Transfer finished. Open the report for destination links and item outcomes.');
     } catch (error) {
       if (error instanceof Stopped) return;
       this.store.updateJob(row.id, error instanceof ReviewRequired ? 'needs_review' : error instanceof ProviderError ? 'paused' : 'failed', error instanceof ProviderError || error instanceof ReviewRequired ? error.message : 'The job could not finish. Check connection settings and resume.');
@@ -114,15 +160,17 @@ export class Worker {
   }
   private async match(jobId: string, step: any, provider: MusicProvider) {
     const entity = this.store.getEntity(step.source_id);
-    if (!entity) { this.store.stepResult(jobId, step.seq, 'skipped', 'Source record no longer exists.'); return; }
-    if (['matched', 'skipped'].includes(entity.matchStatus)) { this.store.stepResult(jobId, step.seq, 'done', 'Previously resolved.'); return; }
-    const candidates = entity.local ? [] : await this.retry(jobId, () => provider.search(entity.kind, `${entity.name} ${entity.kind === 'artist' ? '' : entity.artists.join(' ')}`));
+    if (!entity) { this.store.stepResult(jobId, step.seq, 'skipped', 'Source record no longer exists.'); return false; }
+    if (['matched', 'skipped'].includes(entity.matchStatus)) { this.store.stepResult(jobId, step.seq, 'done', 'Previously resolved.'); return false; }
+    const searched = !entity.local && !entity.candidates.length && entity.matchStatus !== 'missing';
+    const candidates = searched ? await this.retry(jobId, () => provider.search(entity.kind, `${entity.name} ${entity.kind === 'artist' ? '' : entity.artists.join(' ')}`)) : entity.candidates;
     this.check(jobId);
     // A user may have resolved this record while the search request was in flight.
-    if (['matched', 'skipped'].includes(this.store.getEntity(entity.id)!.matchStatus)) { this.store.stepResult(jobId, step.seq, 'done', 'Resolved by owner.'); return; }
+    if (['matched', 'skipped'].includes(this.store.getEntity(entity.id)!.matchStatus)) { this.store.stepResult(jobId, step.seq, 'done', 'Resolved by owner.'); return searched; }
     const result = chooseMatch(entity, candidates);
     this.store.run('UPDATE entities SET status=?,target=?,candidates=?,reason=? WHERE id=?', result.status, result.target ? JSON.stringify(result.target) : null, JSON.stringify(result.candidates), result.reason, entity.id);
     this.store.stepResult(jobId, step.seq, result.status === 'skipped' ? 'skipped' : 'done', result.reason);
+    return searched;
   }
   private async transferStep(jobId: string, step: any, provider: MusicProvider) {
     const source = JSON.parse(step.source_id);

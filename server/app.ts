@@ -17,7 +17,7 @@ import { Vault } from './security.js';
 import { importUpload } from './importer.js';
 import { YouTubeAdapter, YouTubeFactory, ProviderError, ReviewRequired, type MusicProvider, type YouTubeCredentials } from './youtube.js';
 import { SpotifyAdapter } from './spotify.js';
-import { Worker, createTransfer, selectedEntities } from './worker.js';
+import { Worker, queueTransfer, selectedEntities } from './worker.js';
 import type { TransferSelection } from '../shared/types.js';
 
 const selectionSchema = z.object({ collectionIds: z.array(z.string()).max(10000), likes: z.boolean(), songs: z.boolean(), albums: z.boolean(), artists: z.boolean(), favoriteIds: z.array(z.string()).max(200) });
@@ -188,9 +188,9 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
     if (body.action === 'approve' && !target) throw fail('Search for or select an existing catalog candidate first.');
     store.run('UPDATE entities SET status=?,target=?,reason=? WHERE id=?', body.action === 'approve' ? 'matched' : body.action === 'skip' ? 'skipped' : 'pending', body.action === 'approve' ? JSON.stringify(target) : null, body.action === 'approve' ? 'Approved by owner.' : body.action === 'skip' ? 'Skipped by owner.' : null, id); return { ok: true };
   });
-  app.post('/api/transfers', { schema: { tags: ['Transfers'], summary: 'Start a transfer with frozen source and match decisions' } }, async request => {
+  app.post('/api/transfers', { schema: { tags: ['Transfers'], summary: 'Choose best matches and transfer the selected music automatically' } }, async request => {
     const selection = selectionSchema.parse(request.body); const provider = await getProvider();
-    try { return createTransfer(store, selection, provider.identity); } catch (error: any) { throw fail(error.message, 409); }
+    try { return queueTransfer(store, selection, provider.identity); } catch (error: any) { throw fail(error.message, 409); }
   });
   app.get('/api/jobs', { schema: { tags: ['Transfers'], summary: 'List persisted jobs' } }, async request => {
     const p = pagination(request.query); return { items: store.all('SELECT * FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?', p.pageSize, p.offset).map(row => store.jobView(row)), total: store.get('SELECT COUNT(*) n FROM jobs')!.n, page: p.page, pageSize: p.pageSize };

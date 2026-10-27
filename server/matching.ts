@@ -20,6 +20,7 @@ export function chooseMatch(source: SourceEntity, candidates: Candidate[]): { st
     && (source.durationMs === undefined || c.durationMs === undefined || Math.abs(source.durationMs - c.durationMs) <= Math.max(5000, source.durationMs * 0.03)));
   const albumExact = source.album ? exact.filter(c => c.album && normalize(c.album) === normalize(source.album!)) : [];
   const strong = albumExact.length ? albumExact : exact;
-  if (strong.length === 1) return { status: 'matched', target: strong[0], candidates: scored, reason: 'Unambiguous title, artist, and version match.' };
-  return { status: scored.length ? 'review' : 'missing', candidates: scored, reason: scored.length ? 'Choose the correct recording or skip this item.' : 'No available catalog match found.' };
+  const target = strong[0] || scored[0];
+  if (target) return { status: 'matched', target, candidates: scored, reason: 'Best available match selected automatically.' };
+  return { status: 'skipped', candidates: scored, reason: 'No available catalog match found. Skipped automatically.' };
 }
