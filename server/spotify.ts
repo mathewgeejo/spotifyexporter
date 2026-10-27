@@ -4,10 +4,21 @@ import { Store, hash, now } from './store.js';
 import type { Vault } from './security.js';
 import { parseSong } from './importer.js';
 import { ProviderError, ReviewRequired } from './youtube.js';
+import { SpotifyWebClient, spotifyCookie, webSong, type SpotifyWebCredentials } from './spotify-web.js';
 
 interface SpotifyToken { access_token: string; refresh_token: string; expires_at: number; account: string; userId: string }
 export class SpotifyAdapter {
+  private browser?: { cookie: string; client: SpotifyWebClient };
   constructor(private readonly store: Store, private readonly vault: Vault) {}
+  clear() { this.browser = undefined; }
+  async connectWeb(cookie: string) {
+    const normalized = spotifyCookie(cookie);
+    const client = new SpotifyWebClient(normalized);
+    const profile = await client.profile();
+    this.vault.set('spotify', { mode: 'web', cookie: normalized, ...profile } satisfies SpotifyWebCredentials);
+    this.browser = { cookie: normalized, client };
+    return profile;
+  }
   startAuthorization() {
     if (!config.spotifyClientId) throw new Error('Set SPOTIFY_CLIENT_ID in the server configuration first.');
     const state = randomBytes(32).toString('hex'); const verifier = randomBytes(48).toString('base64url');
@@ -57,6 +68,10 @@ export class SpotifyAdapter {
     }
   }
   async importAll(jobId: string, check: () => void) {
+    const credentials = this.vault.get<SpotifyWebCredentials | SpotifyToken>('spotify');
+    const payload = JSON.parse(this.store.get('SELECT payload FROM jobs WHERE id=?', jobId)?.payload || '{}');
+    if (payload.userId && credentials?.userId !== payload.userId) throw new ReviewRequired('This import belongs to a different Spotify account. Reconnect that account before resuming.');
+    if (credentials && 'mode' in credentials && credentials.mode === 'web') return this.importWeb(jobId, credentials, check);
     const token = this.vault.get<SpotifyToken>('spotify'); if (!token) throw new ProviderError('Connect Spotify first.', 401);
     let count = 0; const update = (message: string) => this.store.run('UPDATE jobs SET done=?,message=?,updated=? WHERE id=?', count, message, now(), jobId);
     for await (const playlists of this.pages('/me/playlists?limit=50')) {
@@ -103,5 +118,57 @@ export class SpotifyAdapter {
       });
     }
     this.store.run('UPDATE jobs SET total=?,done=?,message=?,updated=? WHERE id=?', count, count, 'Spotify snapshot imported. Lifetime history still requires the extended-history archive.', now(), jobId);
+  }
+  private async importWeb(jobId: string, credentials: SpotifyWebCredentials, check: () => void) {
+    if (this.browser?.cookie !== credentials.cookie) this.browser = { cookie: credentials.cookie, client: new SpotifyWebClient(credentials.cookie) };
+    const client = this.browser.client;
+    const profile = await client.profile(); check();
+    if (profile.userId !== credentials.userId) throw new ReviewRequired('The Spotify account changed. Reconnect the intended account before importing.');
+    let count = 0; let skipped = 0;
+    const update = (message: string) => this.store.run('UPDATE jobs SET done=?,message=?,updated=? WHERE id=?', count, message, now(), jobId);
+    for await (const page of client.pages('libraryV3', {
+      filters: [], order: null, textFilter: '', features: ['LIKED_SONGS'], flatten: true, expandedFolders: [], folderUri: null, includeFoldersWhenFlattening: true,
+    }, data => data.me?.libraryV3, check)) {
+      for (const entry of page.items) {
+        check(); const wrapper = entry?.item || entry; const item = wrapper?.data || wrapper;
+        if (!item) continue;
+        if (item.__typename === 'Playlist') {
+          const songs: Omit<import('../shared/types.js').SourceEntity, 'id'>[] = [];
+          let metadata = item; let omitted = 0;
+          for await (const contents of client.pages('fetchPlaylist', { uri: item.uri || wrapper._uri, enableWatchFeedEntrypoint: false }, data => {
+            if (data.playlistV2?.__typename === 'NotFound') throw new ProviderError('A Spotify playlist is no longer available. Remove it from your library or import an Account data export.', 404);
+            metadata = data.playlistV2; return metadata?.content;
+          }, check)) {
+            for (const record of contents.items) { const song = webSong(record); if (song) songs.push(song); else omitted++; }
+          }
+          check();
+          const ids = this.store.transaction(() => songs.map(song => this.store.entity(song)));
+          const uri = metadata.uri || item.uri || wrapper._uri;
+          this.store.collection(`spotify:${credentials.userId}:${uri.split(':').at(-1)}`, {
+            name: metadata.name || item.name, description: metadata.description || '', sourceUri: uri,
+          }, ids);
+          skipped += omitted; count++; update(`Imported ${metadata.name || item.name} (${songs.length} songs).`);
+        } else if (item.__typename === 'Album') {
+          this.store.entity({ kind: 'album', name: item.name, uri: item.uri || wrapper._uri,
+            artists: (item.artists?.items || []).map((artist: any) => artist.profile?.name || artist.name).filter(Boolean), saved: true }); count++;
+        } else if (item.__typename === 'Artist') {
+          const name = item.profile?.name || item.name;
+          if (name) { this.store.entity({ kind: 'artist', name, artists: [name], uri: item.uri || wrapper._uri, followed: true }); count++; }
+        }
+      }
+      update(`Imported ${count} Spotify playlists, albums, and artists. Reading the next page…`);
+    }
+    for await (const page of client.pages('fetchLibraryTracks', {}, data => data.me?.library?.tracks, check)) {
+      this.store.transaction(() => {
+        for (const record of page.items) {
+          const song = webSong(record, { liked: true, saved: true });
+          if (song) { this.store.entity(song); count++; } else skipped++;
+        }
+      });
+      update(`Imported ${count} Spotify library records, including liked songs.`);
+    }
+    check();
+    this.store.run('UPDATE jobs SET total=?,done=?,skipped=?,message=?,updated=? WHERE id=?', count + skipped, count, skipped,
+      `Spotify library imported: ${count} records.${skipped ? ` ${skipped} unavailable tracks or non-music entries omitted.` : ''} Listening history can be added from an export.`, now(), jobId);
   }
 }

@@ -87,7 +87,8 @@ export class Worker {
     try {
       if (row.kind === 'spotify_import') {
         if (!this.spotify) throw new Error('Spotify integration is unavailable.');
-        await this.spotify.importAll(row.id, () => this.check(row.id)); this.check(row.id); this.store.updateJob(row.id, 'completed'); return;
+        await this.retry(row.id, () => this.spotify!.importAll(row.id, () => this.check(row.id))); this.check(row.id);
+        this.store.updateJob(row.id, this.store.getJob(row.id)!.skipped ? 'completed_with_issues' : 'completed'); return;
       }
       const provider = await this.getProvider(); this.check(row.id); const payload = JSON.parse(row.payload);
       if (payload.account && payload.account !== provider.identity) throw new ReviewRequired('This job belongs to a different YouTube account. Reconnect that account to resume.');

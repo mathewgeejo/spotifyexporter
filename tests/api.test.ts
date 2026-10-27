@@ -3,17 +3,22 @@ import assert from 'node:assert/strict';
 import { createApp, csvRow } from '../server/app.js';
 import { FakeMusic, temporaryDirectory } from './helpers.js';
 
-test('owner authentication, CSRF, encrypted credentials, pagination, history qualification, and exports', async () => {
+test('workspace opens without a login and retains CSRF, encrypted credentials, pagination, history, and exports', async () => {
   const temp = await temporaryDirectory(); const provider = new FakeMusic(); const { app, store, vault } = await createApp({ dataDir: temp.directory, providerFactory: async () => provider, startWorker: false });
   try {
     for (const url of ['/api/overview', '/api/connections', '/api/library/entities', '/api/history', '/api/jobs', '/api/export', '/api/docs/json']) assert.equal((await app.inject({ url })).statusCode, 401, url);
-    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'short' } })).statusCode, 400);
-    const setup = await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'a secure owner password' } }); assert.equal(setup.statusCode, 200);
+    store.setSetting('owner-password', 'old installation password is not a login gate');
+    const setup = await app.inject({ url: '/api/auth/status' }); assert.equal(setup.statusCode, 200);
+    assert.equal(setup.json().authenticated, true); assert.equal(setup.json().setupRequired, false);
     const cookie = String(setup.headers['set-cookie']).split(';')[0]; const csrf = setup.json().csrf; const headers = { cookie, 'x-csrf-token': csrf };
     assert.match(String(setup.headers['set-cookie']), /HttpOnly/); assert.match(String(setup.headers['set-cookie']), /SameSite=Lax/i);
     assert.equal((await app.inject({ method: 'POST', url: '/api/matches', headers: { cookie }, payload: {} })).statusCode, 403);
-    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/login', headers: { origin: 'https://evil.example' }, payload: { password: 'a secure owner password' } })).statusCode, 403);
-    assert.equal((await app.inject({ method: 'POST', url: '/api/auth/setup', payload: { password: 'another owner password' } })).statusCode, 409);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/matches', headers: { ...headers, origin: 'https://evil.example' }, payload: {} })).statusCode, 403);
+    assert.equal((await app.inject({ url: '/api/auth/status', headers: { 'sec-fetch-site': 'cross-site' } })).statusCode, 403);
+    const sameSession = await app.inject({ url: '/api/auth/status', headers: { cookie } }); assert.equal(sameSession.json().csrf, csrf);
+    assert.match(String(sameSession.headers['cache-control']), /no-store/);
+    const invalidSpotify = await app.inject({ method: 'POST', url: '/api/connections/spotify', headers, payload: { cookie: 'some_other_cookie=not_a_spotify_session' } });
+    assert.equal(invalidSpotify.statusCode, 400); assert.match(invalidSpotify.json().error, /sp_dc/);
     vault.set('youtube', { cookie: 'TOP_SECRET_COOKIE', identity: '@owner', account: 'Owner' });
     assert.doesNotMatch(store.setting('secret:youtube')!, /TOP_SECRET_COOKIE/);
     const connection = await app.inject({ url: '/api/connections', headers }); assert.doesNotMatch(connection.body, /TOP_SECRET_COOKIE/);
@@ -47,5 +52,6 @@ test('owner authentication, CSRF, encrypted credentials, pagination, history qua
     assert.equal(csvRow(['=IMPORTDATA("evil")']).startsWith('"\'=IMPORTDATA'), true);
     assert.equal((await app.inject({ method: 'POST', url: '/api/auth/logout', headers })).statusCode, 200);
     assert.equal((await app.inject({ url: '/api/overview', headers })).statusCode, 401);
+    const reopened = await app.inject({ url: '/api/auth/status' }); assert.equal(reopened.statusCode, 200); assert.equal(reopened.json().authenticated, true);
   } finally { await app.close(); await temp.cleanup(); }
 });

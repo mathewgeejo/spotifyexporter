@@ -64,7 +64,7 @@ export interface Job {
 export interface Page<T> { items: T[]; total: number; page: number; pageSize: number }
 export interface ConnectionStatus {
   youtube: { connected: boolean; account?: string; channelId?: string };
-  spotify: { configured: boolean; connected: boolean; account?: string };
+  spotify: { configured: boolean; connected: boolean; account?: string; mode?: 'web' | 'oauth' };
 }
 export interface TransferSelection {
   collectionIds: string[];

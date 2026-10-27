@@ -13,7 +13,7 @@ import { Readable } from 'node:stream';
 import { z } from 'zod';
 import { config } from './config.js';
 import { Store, hash, now } from './store.js';
-import { Vault, passwordHash, verifyPassword } from './security.js';
+import { Vault } from './security.js';
 import { importUpload } from './importer.js';
 import { YouTubeAdapter, YouTubeFactory, ProviderError, ReviewRequired, type MusicProvider, type YouTubeCredentials } from './youtube.js';
 import { SpotifyAdapter } from './spotify.js';
@@ -21,7 +21,6 @@ import { Worker, createTransfer, selectedEntities } from './worker.js';
 import type { TransferSelection } from '../shared/types.js';
 
 const selectionSchema = z.object({ collectionIds: z.array(z.string()).max(10000), likes: z.boolean(), songs: z.boolean(), albums: z.boolean(), artists: z.boolean(), favoriteIds: z.array(z.string()).max(200) });
-const passwordSchema = z.object({ password: z.string().min(10).max(200) });
 const pageQuery = z.object({ page: z.coerce.number().int().min(1).default(1), pageSize: z.coerce.number().int().min(1).max(100).default(30), q: z.string().max(200).default('') });
 function pagination(query: unknown) { const { page, pageSize, q } = pageQuery.parse(query); return { page, pageSize, q, offset: (page - 1) * pageSize }; }
 export function csvRow(values: unknown[]): string {
@@ -38,11 +37,10 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   const app = Fastify({ logger: { level: 'warn', redact: ['req.headers.cookie', 'req.headers.authorization', 'req.body', 'res.headers.set-cookie'] }, bodyLimit: 65536, requestTimeout: 300000 });
   await app.register(cookie);
   await app.register(multipart, { limits: { fileSize: config.maxUploadBytes, files: 1, fields: 0 } });
-  await app.register(swagger, { openapi: { info: { title: 'Encore API', version: '1.0.0', description: 'Owner-authenticated music migration API. Writes require the x-csrf-token returned by login.' }, components: { securitySchemes: { ownerSession: { type: 'apiKey', in: 'cookie', name: 'encore_session' } } }, security: [{ ownerSession: [] }] } });
+  await app.register(swagger, { openapi: { info: { title: 'Encore API', version: '1.1.0', description: 'Local music migration workspace. GET /api/auth/status opens a browser session without a login and returns the x-csrf-token required for writes.' }, components: { securitySchemes: { workspaceSession: { type: 'apiKey', in: 'cookie', name: 'encore_session' } } }, security: [{ workspaceSession: [] }] } });
   const selectionBody = { type: 'object', required: ['collectionIds', 'likes', 'songs', 'albums', 'artists', 'favoriteIds'], properties: { collectionIds: { type: 'array', items: { type: 'string' }, maxItems: 10000 }, likes: { type: 'boolean' }, songs: { type: 'boolean' }, albums: { type: 'boolean' }, artists: { type: 'boolean' }, favoriteIds: { type: 'array', items: { type: 'string' }, maxItems: 200 } } };
   const inputSchemas: Record<string, any> = {
-    '/api/auth/setup': { type: 'object', required: ['password'], properties: { password: { type: 'string', minLength: 10, maxLength: 200, format: 'password' } } },
-    '/api/auth/login': { type: 'object', required: ['password'], properties: { password: { type: 'string', maxLength: 200, format: 'password' } } },
+    '/api/connections/spotify': { type: 'object', required: ['cookie'], properties: { cookie: { type: 'string', minLength: 20, maxLength: 32000, description: 'Spotify sp_dc cookie or full Cookie header from open.spotify.com. Stored encrypted.' } } },
     '/api/connections/youtube': { type: 'object', required: ['cookie'], properties: { cookie: { type: 'string', minLength: 20, maxLength: 32000, description: 'Cookie request-header value from the intended YouTube Music account. Stored encrypted; never returned.' }, accountIndex: { type: 'integer', minimum: 0, maximum: 20, default: 0 }, channelId: { type: 'string', description: 'Optional YouTube channel or brand-account ID.' } } },
     '/api/matches': selectionBody, '/api/transfers': selectionBody,
     '/api/matches/:id/search': { type: 'object', required: ['query'], properties: { query: { type: 'string', minLength: 2, maxLength: 300 } } },
@@ -52,58 +50,41 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   app.addHook('onRoute', route => {
     const method = String(route.method);
     if (['POST', 'PATCH', 'DELETE'].includes(method) && inputSchemas[route.url]) route.schema = { ...route.schema, body: inputSchemas[route.url] };
-    if (['POST', 'PATCH', 'DELETE'].includes(method) && !route.url.startsWith('/api/auth/setup') && !route.url.startsWith('/api/auth/login')) route.schema = { ...route.schema, headers: { type: 'object', properties: { 'x-csrf-token': { type: 'string', description: 'CSRF token returned by owner login or auth/status.' } }, required: ['x-csrf-token'] } };
+    if (['POST', 'PATCH', 'DELETE'].includes(method)) route.schema = { ...route.schema, headers: { type: 'object', properties: { 'x-csrf-token': { type: 'string', description: 'CSRF token returned by GET /api/auth/status.' } }, required: ['x-csrf-token'] } };
   });
-  const attempts = new Map<string, { count: number; until: number }>();
   app.addHook('onRequest', async (request, reply) => {
     const path = request.url.split('?')[0]; if (!path.startsWith('/api')) return;
-    const publicPaths = ['/api/auth/status', '/api/auth/setup', '/api/auth/login'];
+    reply.header('Cache-Control', 'no-store');
+    if (request.headers['sec-fetch-site'] === 'cross-site') return reply.code(403).send({ error: 'Request origin is not allowed.' });
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method)) {
       const origin = request.headers.origin;
       const devOrigin = process.env.NODE_ENV !== 'production' && (origin === 'http://127.0.0.1:5173' || origin === 'http://localhost:5173');
       if ((origin && origin !== new URL(config.appUrl).origin && !devOrigin) || request.headers['sec-fetch-site'] === 'cross-site') return reply.code(403).send({ error: 'Request origin is not allowed.' });
     }
-    if (publicPaths.includes(path)) return;
+    if (path === '/api/auth/status') return;
     const token = request.cookies.encore_session;
     const session = token ? store.get('SELECT * FROM sessions WHERE id=? AND expires>?', hash(token), Date.now()) : undefined;
-    if (!session) return reply.code(401).send({ error: 'Sign in to your installation.' });
+    if (!session) return reply.code(401).send({ error: 'Open the workspace to initialize a session, then try again.' });
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && request.headers['x-csrf-token'] !== session.csrf) return reply.code(403).send({ error: 'Session verification failed. Reload and try again.' });
   });
   app.setErrorHandler((error: any, _request, reply) => {
     if (error instanceof z.ZodError) return reply.code(400).send({ error: error.issues.map((i: any) => `${i.path.join('.')}: ${i.message}`).join('; ') });
-    if (error instanceof ProviderError) return reply.code(error.status === 401 || error.status === 403 ? 409 : 502).send({ error: error.message });
+    if (error instanceof ProviderError) return reply.code(error.status === 400 || error.status === 422 ? 400 : error.status === 401 || error.status === 403 ? 409 : 502).send({ error: error.message });
     if (error instanceof ReviewRequired) return reply.code(409).send({ error: error.message });
     if (error.statusCode && error.statusCode < 500) return reply.code(error.statusCode).send({ error: error.message });
     return reply.code(500).send({ error: 'The request could not be completed. Check the installation and try again.' });
   });
   const fail = (message: string, statusCode = 400) => Object.assign(new Error(message), { statusCode });
-  const auth = (request: any, reply: any) => {
+  const openSession = (reply: any) => {
     const token = randomBytes(32).toString('hex'); const csrf = randomBytes(32).toString('hex');
     store.run('DELETE FROM sessions WHERE expires<?', Date.now());
     store.run('INSERT INTO sessions VALUES (?,?,?)', hash(token), csrf, Date.now() + 7 * 86400000);
     reply.setCookie('encore_session', token, { path: '/', httpOnly: true, sameSite: 'lax', secure: config.secureCookies, maxAge: 7 * 86400 });
     return { authenticated: true, setupRequired: false, csrf };
   };
-  app.get('/api/auth/status', { schema: { tags: ['Owner'], summary: 'Read owner-session status' } }, async request => {
+  app.get('/api/auth/status', { schema: { tags: ['Workspace'], summary: 'Open or renew the local workspace session without a login', security: [] } }, async (request, reply) => {
     const session = request.cookies.encore_session ? store.get('SELECT csrf FROM sessions WHERE id=? AND expires>?', hash(request.cookies.encore_session), Date.now()) : undefined;
-    return { authenticated: !!session, setupRequired: !store.setting('owner-password'), csrf: session?.csrf };
-  });
-  app.post('/api/auth/setup', { schema: { tags: ['Owner'], summary: 'Set the first owner password' } }, async (request, reply) => {
-    const { password } = passwordSchema.parse(request.body);
-    if (store.setting('owner-password')) throw fail('An owner is already configured.', 409);
-    store.run('INSERT INTO settings VALUES (?,?)', 'owner-password', passwordHash(password)); return auth(request, reply);
-  });
-  app.post('/api/auth/login', { schema: { tags: ['Owner'], summary: 'Sign in and receive a CSRF token' } }, async (request, reply) => {
-    const { password } = z.object({ password: z.string().max(200) }).parse(request.body);
-    const current = attempts.get(request.ip);
-    if (current && current.until > Date.now() && current.count >= 10) throw fail('Too many sign-in attempts. Try again in 15 minutes.', 429);
-    const encoded = store.setting('owner-password');
-    if (!encoded || !verifyPassword(password, encoded)) {
-      if (attempts.size > 1000) for (const [ip, attempt] of attempts) if (attempt.until < Date.now()) attempts.delete(ip);
-      attempts.set(request.ip, { count: current && current.until > Date.now() ? current.count + 1 : 1, until: Date.now() + 900000 });
-      throw fail('Password did not match.', 401);
-    }
-    attempts.delete(request.ip); return auth(request, reply);
+    return session ? { authenticated: true, setupRequired: false, csrf: session.csrf } : openSession(reply);
   });
   app.post('/api/auth/logout', async (request, reply) => { if (request.cookies.encore_session) store.run('DELETE FROM sessions WHERE id=?', hash(request.cookies.encore_session)); reply.clearCookie('encore_session', { path: '/' }); return { ok: true }; });
 
@@ -151,7 +132,13 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   });
   app.get('/api/connections', { schema: { tags: ['Connections'], summary: 'Read account names without credentials' } }, async () => {
     const yt = vault.get<YouTubeCredentials>('youtube'); const sp = vault.get<any>('spotify');
-    return { youtube: { connected: !!yt, account: yt?.account, channelId: yt?.channelId }, spotify: { configured: !!config.spotifyClientId, connected: !!sp, account: sp?.account } };
+    return { youtube: { connected: !!yt, account: yt?.account, channelId: yt?.channelId }, spotify: { configured: !!config.spotifyClientId, connected: !!sp, account: sp?.account, mode: sp ? sp.mode || 'oauth' : undefined } };
+  });
+  app.post('/api/connections/spotify', { schema: { tags: ['Connections'], summary: 'Connect a Spotify Free or Premium web-player session without a developer app' } }, async request => {
+    if (worker.isBusy || store.get("SELECT id FROM jobs WHERE status IN ('running','queued')")) throw fail('Pause active jobs and wait for their current request before changing accounts.', 409);
+    const { cookie } = z.object({ cookie: z.string().min(20).max(32000) }).parse(request.body);
+    const profile = await spotify.connectWeb(cookie);
+    return { connected: true, account: profile.account, mode: 'web' };
   });
   app.post('/api/connections/youtube', { schema: { tags: ['Connections'], summary: 'Validate and encrypt a YouTube session cookie' } }, async request => {
     if (worker.isBusy || store.get("SELECT id FROM jobs WHERE status IN ('running','queued')")) throw fail('Pause active jobs and wait for their current request before changing accounts.', 409);
@@ -162,7 +149,7 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   app.delete('/api/connections/:provider', { schema: { tags: ['Connections'], summary: 'Disconnect and remove stored provider credentials' } }, async request => {
     const { provider } = z.object({ provider: z.enum(['youtube', 'spotify']) }).parse(request.params);
     store.run("UPDATE jobs SET status='paused',message='Account disconnected. Reconnect before resuming.' WHERE status IN ('running','queued')");
-    vault.remove(provider); if (provider === 'spotify') vault.remove('spotify-pkce'); factory.clear(); return { ok: true };
+    vault.remove(provider); if (provider === 'spotify') { vault.remove('spotify-pkce'); spotify.clear(); } factory.clear(); return { ok: true };
   });
   app.post('/api/connections/spotify/authorize', { schema: { tags: ['Connections'], summary: 'Start Spotify PKCE authorization' } }, async () => {
     try { return spotify.startAuthorization(); } catch (error: any) { throw fail(error.message); }
@@ -174,8 +161,10 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
     return reply.redirect(`${config.appUrl}/?spotify=connected`);
   });
   app.post('/api/imports/spotify', { schema: { tags: ['Imports'], summary: 'Queue a paginated Spotify snapshot import' } }, async () => {
-    if (!vault.get('spotify')) throw fail('Connect Spotify first.');
-    return store.job('spotify_import', {});
+    const account = vault.get<{ userId: string }>('spotify');
+    if (!account) throw fail('Connect Spotify first.');
+    if (store.get("SELECT id FROM jobs WHERE kind='spotify_import' AND status IN ('queued','running')")) throw fail('A Spotify import is already in progress. View it in Transfers.', 409);
+    return store.job('spotify_import', { userId: account.userId });
   });
   app.post('/api/matches', { schema: { tags: ['Matching'], summary: 'Queue catalog matching for selected collections' } }, async request => {
     const selection = selectionSchema.parse(request.body); const ids = selectedEntities(store, selection);
