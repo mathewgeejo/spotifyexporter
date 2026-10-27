@@ -49,6 +49,15 @@ export interface ListeningEvent {
   source: string;
 }
 export type JobStatus = 'queued' | 'running' | 'paused' | 'needs_review' | 'completed' | 'completed_with_issues' | 'failed' | 'cancelled';
+export interface TransferSummary {
+  sourceItems: number;
+  playlists: number;
+  playlistEntries: number;
+  likes: number;
+  savedSongs: number;
+  albums: number;
+  artists: number;
+}
 export interface Job {
   id: string;
   kind: 'match' | 'transfer' | 'spotify_import';
@@ -60,10 +69,11 @@ export interface Job {
   message: string;
   createdAt: string;
   updatedAt: string;
+  summary?: TransferSummary;
 }
 export interface Page<T> { items: T[]; total: number; page: number; pageSize: number }
 export interface ConnectionStatus {
-  youtube: { connected: boolean; account?: string; channelId?: string };
+  youtube: { connected: boolean; account?: string; channelId?: string; needsReconnect?: boolean };
   spotify: { configured: boolean; connected: boolean; account?: string; mode?: 'web' | 'oauth' };
 }
 export interface TransferSelection {

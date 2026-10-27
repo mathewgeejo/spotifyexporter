@@ -15,7 +15,7 @@ import { config } from './config.js';
 import { Store, hash, now } from './store.js';
 import { Vault } from './security.js';
 import { importUpload } from './importer.js';
-import { YouTubeAdapter, YouTubeFactory, ProviderError, ReviewRequired, type MusicProvider, type YouTubeCredentials } from './youtube.js';
+import { YouTubeAdapter, YouTubeFactory, YouTubeSessionError, ProviderError, ReviewRequired, type MusicProvider, type YouTubeCredentials } from './youtube.js';
 import { SpotifyAdapter } from './spotify.js';
 import { Worker, queueTransfer, selectedEntities } from './worker.js';
 import type { TransferSelection } from '../shared/types.js';
@@ -69,7 +69,7 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   });
   app.setErrorHandler((error: any, _request, reply) => {
     if (error instanceof z.ZodError) return reply.code(400).send({ error: error.issues.map((i: any) => `${i.path.join('.')}: ${i.message}`).join('; ') });
-    if (error instanceof ProviderError) return reply.code(error.status === 400 || error.status === 422 ? 400 : error.status === 401 || error.status === 403 ? 409 : 502).send({ error: error.message });
+    if (error instanceof ProviderError) return reply.code(error.status === 400 || error.status === 422 ? 400 : error.status === 401 || error.status === 403 ? 409 : 502).send({ error: error.message, ...(error instanceof YouTubeSessionError ? { code: 'YOUTUBE_RECONNECT_REQUIRED' } : {}) });
     if (error instanceof ReviewRequired) return reply.code(409).send({ error: error.message });
     if (error.statusCode && error.statusCode < 500) return reply.code(error.statusCode).send({ error: error.message });
     return reply.code(500).send({ error: 'The request could not be completed. Check the installation and try again.' });
@@ -132,7 +132,7 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   });
   app.get('/api/connections', { schema: { tags: ['Connections'], summary: 'Read account names without credentials' } }, async () => {
     const yt = vault.get<YouTubeCredentials>('youtube'); const sp = vault.get<any>('spotify');
-    return { youtube: { connected: !!yt, account: yt?.account, channelId: yt?.channelId }, spotify: { configured: !!config.spotifyClientId, connected: !!sp, account: sp?.account, mode: sp ? sp.mode || 'oauth' : undefined } };
+    return { youtube: { connected: !!yt, account: yt?.account, channelId: yt?.channelId, needsReconnect: factory.needsReconnect }, spotify: { configured: !!config.spotifyClientId, connected: !!sp, account: sp?.account, mode: sp ? sp.mode || 'oauth' : undefined } };
   });
   app.post('/api/connections/spotify', { schema: { tags: ['Connections'], summary: 'Connect a Spotify Free or Premium web-player session without a developer app' } }, async request => {
     if (worker.isBusy || store.get("SELECT id FROM jobs WHERE status IN ('running','queued')")) throw fail('Pause active jobs and wait for their current request before changing accounts.', 409);

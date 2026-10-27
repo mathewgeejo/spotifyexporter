@@ -42,7 +42,7 @@ For a production installation without Docker, run `npm run build` once, then `np
 2. In a signed-in `open.spotify.com` tab, open developer tools → **Application → Cookies → https://open.spotify.com** (Firefox: **Storage → Cookies**). Copy the **Value** of the `sp_dc` cookie.
 3. Paste it into **Spotify session cookie** and choose **Connect & import library**. The account name is verified before the session is saved. Follow import progress in **Transfers**.
 4. Connect YouTube Music using the instructions below. A YouTube channel is needed to hold playlists; a paid subscription is not required.
-5. Open **Your collection**, choose playlists and library options, then **Find matches**. Review uncertain results and start your transfer. Progress and downloadable reports are in **Transfers**.
+5. Open **Your collection**, choose playlists and library options, then **Start transfer**. The best matches are selected automatically. Progress and downloadable reports are in **Transfers**.
 
 The browser connector implements Spotify web-player requests, following the protocol documented by [SpotAPI](https://github.com/Aran404/SpotAPI). It discovers current query hashes from Spotify's own scripts rather than fixing them to one player release. The public application challenge uses rotating data from [spotify-secrets](https://code.thetadev.de/ThetaDev/spotify-secrets). Source account access is read-only; no Spotify playlists or likes are modified. Session cookies are encrypted, and temporary access tokens stay in server memory. Do not share these cookies. If a session expires, reconnect in Settings and resume the import. Imports include all pages and preserve playlist order and repeated songs; an interrupted playlist does not replace its previous complete snapshot.
 
@@ -78,9 +78,9 @@ Spotify's development mode requires a Premium app owner and approved users, and 
 ## Match and transfer
 
 - Playlists are selected by default. Choose whether to transfer likes, saved songs, albums, and followed artists.
-- Run **Find matches**. Exact, unambiguous title/artist/version matches are selected automatically. Album, explicit status, and duration help when available. Listening time is never treated as recording duration.
-- Review uncertain and missing items. Search for another candidate, select it, or explicitly skip the source. Transfers require every selected source to be resolved. Local audio files are reported as skipped; catalog references are transferred, not audio files.
-- Start the transfer. Playlists go first, followed by likes/saved songs, albums, and artists. New playlists are private and include a small Encore migration marker in their description.
+- Click **Start transfer**. Existing candidates are resolved immediately; remaining songs are searched in a background job, then the transfer starts automatically. Exact title/artist/version matches are preferred, followed by the highest-ranked available result. Equal matches use the first result.
+- Manual review is optional. **Find matches** on the match-review page previews choices without starting a transfer. You can change a candidate or skip an item. Missing recordings and local files are skipped automatically and included in reports; connection failures pause for retry.
+- During transfer, Playlists go first, followed by likes/saved songs, albums, and artists. New playlists are private and include a small Encore migration marker in their description.
 - Jobs persist through page closure. After a server restart, interrupted jobs pause until resumed. Playlist writes are reconciled against ordered destination contents before retries, including duplicate occurrences. Externally changed playlist contents pause the job for review. Restore the prior contents/order before resuming; Encore does not overwrite external edits.
 - Failed operations can be retried from Transfers. Cancelling stops future operations; completed destination writes remain. Reports include each playlist entry and library operation, including skipped and failed items.
 - Listening history remains browsable with date filters. Most-played playlists and additional favorite likes use qualified listening time, excluding explicit skips and plays shorter than 30 seconds. Additional likes require selection. YouTube controls recommendation behavior.

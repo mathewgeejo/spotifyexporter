@@ -5,6 +5,12 @@ import type { Vault } from './security.js';
 export class ProviderError extends Error {
   constructor(message: string, readonly status = 502, readonly retryAfter = 0) { super(message); }
 }
+export class PlaylistWriteRejected extends ProviderError {}
+export class YouTubeSessionError extends ProviderError {
+  constructor(status = 401) {
+    super('Your YouTube Music session is signed out or expired. Reconnect in Settings with a fresh Cookie header, then try again.', status);
+  }
+}
 export class ReviewRequired extends Error {}
 export interface YouTubeCredentials { cookie: string; accountIndex: number; channelId?: string; account: string; identity: string }
 export interface MusicProvider {
@@ -34,21 +40,47 @@ function find(value: any, predicate: (value: any) => boolean, seen = new WeakSet
   for (const child of Object.values(value)) { const result = find(child, predicate, seen); if (result) return result; }
 }
 function safeError(error: any): ProviderError {
-  if (error instanceof ProviderError) return error;
-  const info = String(error?.info || '');
-  const status = Number(error?.status || error?.status_code || info.match(/"code"\s*:\s*(\d+)/)?.[1] || String(error?.message).match(/status\s*(\d+)/)?.[1] || 502);
-  if (status === 401 || status === 403) return new ProviderError('YouTube rejected this session. Reconnect your account in Settings.', status);
+  if (error instanceof YouTubeSessionError) return error;
+  let info = error?.info;
+  if (typeof info === 'string') { try { info = JSON.parse(info); } catch { info = undefined; } }
+  const status = Number(error?.status || error?.status_code || info?.error?.code || info?.code || String(error?.message).match(/status(?:\s+code)?\s+(\d{3})/i)?.[1] || 502);
+  if (status === 401 || status === 403) return new YouTubeSessionError(status);
   if (status === 429) return new ProviderError('YouTube is rate limiting requests. The job will wait before retrying.', 429, 30);
+  if (error instanceof ProviderError) return error;
+  if (['AbortError', 'TimeoutError'].includes(error?.name) || /TIMEOUT|TIMEDOUT/.test(error?.cause?.code || '')) return new ProviderError('YouTube Music timed out. Check your connection and retry.', 504);
+  if (error?.cause?.code || error?.message === 'fetch failed') return new ProviderError('Could not reach YouTube Music. Check your connection and retry.', 503);
+  if (/Page contents not found|Account section list not found|Expected node|ParsingError/i.test(String(error?.message))) return new ProviderError('YouTube Music returned an unsupported account or library response. Try reconnecting your account.', 502);
   return new ProviderError('YouTube Music could not complete the request. Retry or reconnect if the problem continues.', status);
+}
+
+function authenticatedFetch(onExpired?: () => void): typeof fetch {
+  return async (input, init) => {
+    const response = await fetch(input, { ...init, signal: AbortSignal.timeout(30000) });
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+    // YouTube also returns signed-out pages with HTTP 200. Check before SDK parsing
+    // turns them into misleading "Page contents not found" / "Expected node" errors.
+    if (/(^|\.)youtube\.com$/.test(url.hostname) && url.pathname.startsWith('/youtubei/') && !url.pathname.endsWith('/config')) {
+      if (response.status === 401 || response.status === 403) { onExpired?.(); throw new YouTubeSessionError(response.status); }
+      if (response.ok && response.headers.get('content-type')?.includes('json')) {
+        let data: any; try { data = await response.clone().json(); } catch { /* Let the SDK report malformed responses. */ }
+        if (find(data?.responseContext, value => value.loggedOut === true) || [401, 403].includes(data?.error?.code)) {
+          onExpired?.(); throw new YouTubeSessionError(data?.error?.code || 401);
+        }
+      }
+    }
+    return response;
+  };
 }
 
 export class YouTubeAdapter implements MusicProvider {
   constructor(private readonly client: Innertube, readonly identity: string, readonly account: string) {}
-  static async connect(cookie: string, accountIndex = 0, channelId?: string): Promise<{ adapter: YouTubeAdapter; credentials: YouTubeCredentials }> {
+  static async connect(cookie: string, accountIndex = 0, channelId?: string, onExpired?: () => void): Promise<{ adapter: YouTubeAdapter; credentials: YouTubeCredentials }> {
     try {
       const client = await Innertube.create({ cookie, account_index: accountIndex, on_behalf_of_user: channelId, lang: 'en', retrieve_player: false, enable_session_cache: false,
-        fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(30000) }) });
-      const info: any = channelId ? await client.account.getInfo(true) : await client.account.getInfo();
+        fetch: authenticatedFetch(onExpired) });
+      // Browser cookies must use the WEB channel-switcher response; the SDK's
+      // default TV account parser no longer reliably returns account contents.
+      const info: any = await client.account.getInfo(true);
       const accounts: any[] = Array.isArray(info) ? info : info.contents?.contents || [];
       const selected = accounts.find(a => a.is_selected && a.has_channel) || (accounts.length === 1 && accounts[0].has_channel ? accounts[0] : undefined);
       if (!selected) throw new ProviderError('Could not identify the active YouTube channel. Copy a fresh Cookie header from the account you want to use.', 401);
@@ -63,7 +95,7 @@ export class YouTubeAdapter implements MusicProvider {
   private async request(path: string, body: Record<string, unknown>) {
     try {
       const response = await this.client.actions.execute(path, { ...body, client: 'YTMUSIC', parse: false });
-      if (!response.success || response.data?.error) throw new ProviderError('YouTube rejected the requested operation.', response.status_code || 502);
+      if (!response.success || response.data?.error) throw new ProviderError('YouTube rejected the requested operation.', response.data?.error?.code || response.status_code || 502);
       return response.data as any;
     } catch (error) { throw safeError(error); }
   }
@@ -122,7 +154,11 @@ export class YouTubeAdapter implements MusicProvider {
     } catch (error) { throw safeError(error); }
   }
   async append(id: string, videoIds: string[]) {
-    await this.request('/browse/edit_playlist', { playlistId: id, actions: videoIds.map(addedVideoId => ({ action: 'ACTION_ADD_VIDEO', addedVideoId })) });
+    // Skip the duplicate check, preserving intentional repeated playlist entries.
+    // One existing recording otherwise rejects the entire batch, even with HTTP 200.
+    const result = await this.request('/browse/edit_playlist', { playlistId: id,
+      actions: videoIds.map(addedVideoId => ({ action: 'ACTION_ADD_VIDEO', addedVideoId, dedupeOption: 'DEDUPE_OPTION_SKIP' })) });
+    if (result.status && !String(result.status).includes('SUCCEEDED')) throw new PlaylistWriteRejected('YouTube did not accept this playlist batch. Retry to reconcile and continue.', 502);
   }
   async like(id: string) { await this.request('/like/like', { target: { videoId: id } }); }
   async saveSong(candidate: Candidate) {
@@ -164,15 +200,20 @@ export class YouTubeAdapter implements MusicProvider {
 
 export class YouTubeFactory {
   private cached?: { secret: string; provider: MusicProvider };
+  private expired = false;
   constructor(private readonly vault: Vault) {}
-  clear() { this.cached = undefined; }
+  get needsReconnect() { return this.expired; }
+  clear() { this.cached = undefined; this.expired = false; }
   async get(): Promise<MusicProvider> {
     const credentials = this.vault.get<YouTubeCredentials>('youtube');
     if (!credentials) throw new ProviderError('Connect YouTube Music before continuing.', 401);
     const secret = JSON.stringify(credentials);
     if (this.cached?.secret === secret) return this.cached.provider;
-    const { adapter } = await YouTubeAdapter.connect(credentials.cookie, credentials.accountIndex, credentials.channelId);
+    const expired = () => { this.cached = undefined; this.expired = true; };
+    let adapter: YouTubeAdapter;
+    try { ({ adapter } = await YouTubeAdapter.connect(credentials.cookie, credentials.accountIndex, credentials.channelId, expired)); }
+    catch (error) { if (error instanceof YouTubeSessionError) expired(); throw error; }
     if (adapter.identity !== credentials.identity) throw new ReviewRequired('The active YouTube account has changed. Reconnect and start a transfer for the intended account.');
-    this.cached = { secret, provider: adapter }; return adapter;
+    this.expired = false; this.cached = { secret, provider: adapter }; return adapter;
   }
 }

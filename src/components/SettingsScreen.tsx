@@ -24,13 +24,14 @@ export default function SettingsScreen({ connections, run, busy, onImport, navig
     <div className="account-cards">
       {(['spotify', 'youtube'] as const).map(service => {
         const connection = connections[service];
+        const needsReconnect = service === 'youtube' && !!connections.youtube.needsReconnect;
         const name = service === 'spotify' ? 'Spotify' : 'YouTube Music';
         return <section className={`connect-card ${service}`} key={service}>
-          <div className="connect-card-top"><span className="eyebrow">{service === 'spotify' ? '01 / SOURCE' : '02 / DESTINATION'}</span><span className={`connection-state ${connection.connected ? 'ready' : ''}`}><span/>{connection.connected ? 'Connected' : 'Not connected'}</span></div>
+          <div className="connect-card-top"><span className="eyebrow">{service === 'spotify' ? '01 / SOURCE' : '02 / DESTINATION'}</span><span className={`connection-state ${needsReconnect ? 'expired' : connection.connected ? 'ready' : ''}`}><span/>{needsReconnect ? 'Reconnect needed' : connection.connected ? 'Connected' : 'Not connected'}</span></div>
           <div className="connect-brand"><span><ServiceIcon service={service} size={66}/></span><div><h2>{name}</h2><p>{connection.connected ? connection.account : service === 'spotify' ? 'Bring your collection.' : 'Give it a new home.'}</p></div></div>
           <div className="connect-card-bottom">
             <span className="connection-caption">{service === 'spotify' ? 'Playlists & liked songs' : 'Private playlists & likes'}</span>
-            <button className={`btn ${connection.connected ? 'secondary' : 'primary'}`} disabled={busy} onClick={() => connection.connected && service === 'spotify' ? sync() : setConnecting(service)}>{connection.connected ? service === 'spotify' ? <><RefreshCw size={15}/> Refresh library</> : <><RefreshCw size={15}/> Reconnect</> : <>Connect {service === 'spotify' ? 'Spotify' : 'YouTube Music'}<ArrowUpRight size={16}/></>}</button>
+            <button className={`btn ${connection.connected && !needsReconnect ? 'secondary' : 'primary'}`} disabled={busy} onClick={() => connection.connected && service === 'spotify' ? sync() : setConnecting(service)}>{connection.connected ? service === 'spotify' ? <><RefreshCw size={15}/> Refresh library</> : <><RefreshCw size={15}/> Reconnect</> : <>Connect {service === 'spotify' ? 'Spotify' : 'YouTube Music'}<ArrowUpRight size={16}/></>}</button>
           </div>
           {connection.connected && <div className="account-management"><button className="text-button" disabled={busy} onClick={() => setConnecting(service)}>Replace session</button><button className="text-button danger-text" disabled={busy} onClick={() => void run(() => api(`/api/connections/${service}`, { method: 'DELETE' }), `${name} disconnected.`)}>Disconnect</button></div>}
         </section>;

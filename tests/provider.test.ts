@@ -26,6 +26,7 @@ test('YouTube adapter uses music-only candidates, explicit private creation, ord
   const candidates = await adapter.search('song', 'Song Artist'); assert.equal(candidates.length, 1); assert.equal(candidates[0].id, 'song'); assert.equal(candidates[0].durationMs, 180000);
   await adapter.createPlaylist('A playlist', 'Original description'); assert.equal(calls[0].args.privacyStatus, 'PRIVATE'); assert.equal(calls[0].args.description, 'Original description');
   await adapter.append('PLtest', ['song', 'song']); assert.deepEqual(calls[1].args.actions.map((a: any) => a.addedVideoId), ['song', 'song']);
+  assert.equal(calls[1].args.actions.every((action: any) => action.dedupeOption === 'DEDUPE_OPTION_SKIP'), true);
   assert.deepEqual(await adapter.playlistItems('PLtest'), ['song', 'song']);
   await adapter.like('song'); assert.deepEqual(calls[2].args.target, { videoId: 'song' });
   await adapter.saveSong(candidates[0]); await adapter.saveSong(candidates[0]); assert.equal(saved, true);

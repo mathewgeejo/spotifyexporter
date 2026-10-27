@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import type { Collection, EntityView, Job, JobStatus, SourceEntity } from '../shared/types.js';
+import type { Collection, EntityView, Job, JobStatus, SourceEntity, TransferSummary } from '../shared/types.js';
 
 export const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 export const now = () => new Date().toISOString();
@@ -10,6 +10,7 @@ export type Row = Record<string, any>;
 
 export class Store {
   readonly db: DatabaseSync;
+  private readonly summaryCache = new Map<string, TransferSummary>();
   constructor(readonly directory: string) {
     mkdirSync(directory, { recursive: true });
     this.db = new DatabaseSync(join(directory, 'encore.sqlite'));
@@ -73,7 +74,25 @@ export class Store {
     });
     return this.getJob(id)!;
   }
-  jobView(row: Row): Job { return { id: row.id, kind: row.kind, status: row.status, total: row.total, done: row.done, failed: row.failed, skipped: row.skipped, message: row.message, createdAt: row.created, updatedAt: row.updated }; }
+  jobView(row: Row): Job {
+    let summary: TransferSummary | undefined;
+    if (row.kind === 'transfer') {
+      summary = this.summaryCache.get(row.id);
+      if (!summary) {
+        summary = JSON.parse(row.payload).summary;
+        if (!summary) {
+          // Backfill older job views without modifying their saved transfer plans.
+          const counts = Object.fromEntries(this.all('SELECT kind,COUNT(*) n FROM steps WHERE job_id=? GROUP BY kind', row.id).map(item => [item.kind, item.n]));
+          const sourceItems = this.get("SELECT COUNT(DISTINCT COALESCE(json_extract(source_id,'$.entity.id'),json_extract(source_id,'$.id'))) n FROM steps WHERE job_id=? AND kind!='playlist'", row.id)!.n;
+          summary = { sourceItems, playlists: counts.playlist || 0, playlistEntries: counts.playlist_item || 0,
+            likes: counts.like || 0, savedSongs: counts.song || 0, albums: counts.album || 0, artists: counts.artist || 0 };
+        }
+        this.summaryCache.set(row.id, summary!);
+      }
+    }
+    return { id: row.id, kind: row.kind, status: row.status, total: row.total, done: row.done, failed: row.failed, skipped: row.skipped,
+      message: row.message, createdAt: row.created, updatedAt: row.updated, ...(summary ? { summary } : {}) };
+  }
   getJob(id: string): Job | undefined { const row = this.get('SELECT * FROM jobs WHERE id=?', id); return row ? this.jobView(row) : undefined; }
   updateJob(id: string, status: JobStatus, message?: string) {
     this.run('UPDATE jobs SET status=?,message=COALESCE(?,message),updated=? WHERE id=?', status, message ?? null, now(), id);

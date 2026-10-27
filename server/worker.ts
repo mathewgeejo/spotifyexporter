@@ -1,10 +1,12 @@
 import type { Collection, EntityView, TransferSelection } from '../shared/types.js';
 import { Store, hash } from './store.js';
 import { chooseMatch } from './matching.js';
-import { ProviderError, ReviewRequired, type MusicProvider } from './youtube.js';
+import { PlaylistWriteRejected, ProviderError, ReviewRequired, type MusicProvider } from './youtube.js';
 import type { SpotifyAdapter } from './spotify.js';
 
 class Stopped extends Error {}
+class PlaylistConfirmationPending extends Error {}
+interface PendingAppend { jobId: string; start: number; end: number; videoIds: string[] }
 export function selectedEntities(store: Store, selection: TransferSelection): string[] {
   const ids = new Set<string>(selection.favoriteIds);
   for (const id of selection.collectionIds) for (const row of store.all('SELECT entity_id FROM entries WHERE collection_id=? ORDER BY position', id)) ids.add(row.entity_id);
@@ -76,11 +78,14 @@ export function createTransfer(store: Store, selection: TransferSelection, accou
     if (entity.kind === kind && (kind === 'album' ? selection.albums && entity.saved : selection.artists && entity.followed)) steps.push({ kind, sourceId: JSON.stringify(entity) });
   }
   if (!steps.length) throw new Error('Select at least one playlist or library item.');
-  return store.job('transfer', { selection, account, sequences, ...(options.sourceMatchJobId ? { sourceMatchJobId: options.sourceMatchJobId } : {}) }, steps);
+  const count = (kind: string) => steps.filter(step => step.kind === kind).length;
+  const summary = { sourceItems: snapshot.entityIds.length, playlists: count('playlist'), playlistEntries: count('playlist_item'),
+    likes: count('like'), savedSongs: count('song'), albums: count('album'), artists: count('artist') };
+  return store.job('transfer', { selection, account, sequences, summary, ...(options.sourceMatchJobId ? { sourceMatchJobId: options.sourceMatchJobId } : {}) }, steps);
 }
 const equal = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => b[index] === value);
 export function reconcilePlaylist(actual: string[], desired: string[], confirmed: string[]): number {
-  if (actual.length < confirmed.length || !equal(actual.slice(0, confirmed.length), confirmed) || !equal(actual, desired.slice(0, actual.length))) throw new ReviewRequired('Destination playlist changed outside this transfer. Restore its previous order and contents in YouTube Music before resuming.');
+  if (actual.length < confirmed.length || !equal(actual.slice(0, confirmed.length), confirmed) || !equal(actual, desired.slice(0, actual.length))) throw new ReviewRequired('The destination playlist does not match the saved transfer. Check its contents before resuming; no further songs have been added.');
   return actual.length;
 }
 
@@ -113,7 +118,7 @@ export class Worker {
   }
   async tick() {
     if (this.busy || this.closed) return;
-    const row = this.store.get("SELECT * FROM jobs WHERE status='queued' ORDER BY created LIMIT 1"); if (!row) return;
+    const row = this.store.get("SELECT * FROM jobs WHERE status='queued' AND COALESCE(json_extract(payload,'$.nextCheck'),0)<=? ORDER BY created LIMIT 1", Date.now()); if (!row) return;
     this.busy = true; this.store.updateJob(row.id, 'running', 'Working…');
     try {
       if (row.kind === 'spotify_import') {
@@ -132,7 +137,7 @@ export class Worker {
           else if (step.kind === 'playlist_item') await this.playlistItems(row.id, step, provider, payload);
           else await this.transferStep(row.id, step, provider);
         } catch (error) {
-          if (error instanceof ReviewRequired || error instanceof Stopped || (error instanceof ProviderError && [401, 403, 429].includes(error.status))) throw error;
+          if (error instanceof PlaylistConfirmationPending || error instanceof ReviewRequired || error instanceof Stopped || (error instanceof ProviderError && [401, 403, 429].includes(error.status))) throw error;
           this.store.stepResult(row.id, step.seq, 'failed', error instanceof ProviderError ? error.message : 'This item could not be processed. Retry it from the transfer report.');
         }
         if (cooldown) await this.wait(row.id, cooldown);
@@ -155,6 +160,11 @@ export class Worker {
       this.store.updateJob(row.id, job.failed || job.skipped ? 'completed_with_issues' : 'completed', row.kind === 'match' ? 'Best matches selected. Ready to transfer.' : 'Transfer finished. Open the report for destination links and item outcomes.');
     } catch (error) {
       if (error instanceof Stopped) return;
+      if (error instanceof PlaylistConfirmationPending) {
+        this.store.run("UPDATE jobs SET payload=json_set(payload,'$.nextCheck',?) WHERE id=?", Date.now() + 30000, row.id);
+        this.store.updateJob(row.id, 'queued', 'Waiting for YouTube to confirm the last playlist update. Checking again automatically; the batch will not be sent twice.');
+        return;
+      }
       this.store.updateJob(row.id, error instanceof ReviewRequired ? 'needs_review' : error instanceof ProviderError ? 'paused' : 'failed', error instanceof ProviderError || error instanceof ReviewRequired ? error.message : 'The job could not finish. Check connection settings and resume.');
     } finally { this.busy = false; }
   }
@@ -204,6 +214,23 @@ export class Worker {
     }
     this.store.stepResult(jobId, step.seq, 'done', 'Confirmed by YouTube Music.', entity.target.url);
   }
+  private async confirmedPlaylist(jobId: string, provider: MusicProvider, target: string, desired: string[], confirmed: string[], minimum: number) {
+    if (!equal(confirmed, desired.slice(0, confirmed.length))) throw new ReviewRequired('The saved playlist checkpoint belongs to a different song order. Check the destination before resuming.');
+    const delays = [500, 1000, 2000, 4000, 8000, 15000, 30000];
+    for (let attempt = 0; ; attempt++) {
+      this.check(jobId);
+      const actual = await provider.playlistItems(target);
+      // A lagging replica can return an older prefix or mix pages from two revisions.
+      // Reread before declaring an edit, and never append against a stale checkpoint.
+      const prefix = equal(actual, desired.slice(0, actual.length));
+      if (prefix && actual.length >= Math.max(confirmed.length, minimum)) return actual.length;
+      if (attempt === delays.length) {
+        if (!prefix) throw new ReviewRequired('The destination playlist does not match the saved transfer. Check its contents before resuming; no further songs have been added.');
+        throw new PlaylistConfirmationPending();
+      }
+      await this.wait(jobId, delays[attempt]);
+    }
+  }
   private async playlistItems(jobId: string, first: any, provider: MusicProvider, payload: any) {
     const initial = JSON.parse(first.source_id);
     if (initial.destinationIndex < 0) { this.store.stepResult(jobId, first.seq, 'skipped', initial.entity.reason || 'Skipped by owner.'); return; }
@@ -217,17 +244,31 @@ export class Worker {
     const destination = this.store.get('SELECT * FROM destinations WHERE account=? AND kind=? AND source_id=?', provider.identity, 'playlist', initial.collectionId);
     if (!destination || destination.target === '__creating__') throw new ReviewRequired('The destination playlist was not created successfully. Retry its failed creation step.');
     const desired: string[] = payload.sequences[initial.collectionId]; const end = selected.at(-1)!.value.destinationIndex + 1;
+    const intentKey = `playlist-append:${hash(`${provider.identity}:${destination.target}`)}`;
     await this.retry(jobId, async () => {
       this.check(jobId); const saved = this.store.get('SELECT expected FROM destinations WHERE account=? AND kind=? AND source_id=?', provider.identity, 'playlist', initial.collectionId)!;
-      const actual = await provider.playlistItems(destination.target); const count = reconcilePlaylist(actual, desired, JSON.parse(saved.expected));
-      if (count < initial.destinationIndex) throw new ReviewRequired('Earlier playlist entries are incomplete. Retry the failed entries before continuing.');
+      const confirmed: string[] = JSON.parse(saved.expected);
+      const stored = this.store.setting(intentKey);
+      const pending: PendingAppend | undefined = stored ? JSON.parse(stored) : undefined;
+      if (pending && (pending.jobId !== jobId || !equal(pending.videoIds, desired.slice(pending.start, pending.end)))) throw new ReviewRequired('An earlier playlist update still needs confirmation. Resume its original transfer first.');
+      let count = await this.confirmedPlaylist(jobId, provider, destination.target, desired, confirmed, Math.max(initial.destinationIndex, pending?.end || 0));
       if (count < end) {
-        this.check(jobId); await provider.append(destination.target, desired.slice(count, end));
-        const confirmed = await provider.playlistItems(destination.target);
-        if (!equal(confirmed, desired.slice(0, end))) throw new ReviewRequired('YouTube returned unexpected playlist contents after an append. Inspect the destination before resuming.');
+        const videoIds = desired.slice(count, end);
+        this.check(jobId);
+        // Persist before sending: a lost response, stale read, retry, or restart must
+        // check this exact write before it is allowed to append another batch.
+        this.store.setSetting(intentKey, JSON.stringify({ jobId, start: count, end, videoIds } satisfies PendingAppend));
+        try { await provider.append(destination.target, videoIds); }
+        catch (error) {
+          if (error instanceof PlaylistWriteRejected || error instanceof ProviderError && [401, 403, 429].includes(error.status)) this.store.run('DELETE FROM settings WHERE key=?', intentKey);
+          throw error instanceof ProviderError ? error : new ProviderError('YouTube did not confirm the playlist update. Checking the destination before retrying.');
+        }
+        count = await this.confirmedPlaylist(jobId, provider, destination.target, desired, confirmed, end);
       }
-      const expected = desired.slice(0, Math.max(count, end));
-      this.store.run('UPDATE destinations SET expected=? WHERE account=? AND kind=? AND source_id=?', JSON.stringify(expected), provider.identity, 'playlist', initial.collectionId);
+      this.store.transaction(() => {
+        this.store.run('UPDATE destinations SET expected=? WHERE account=? AND kind=? AND source_id=?', JSON.stringify(desired.slice(0, count)), provider.identity, 'playlist', initial.collectionId);
+        this.store.run('DELETE FROM settings WHERE key=?', intentKey);
+      });
     });
     for (const { row, value } of selected) this.store.stepResult(jobId, row.seq, 'done', 'Ordered playlist entry verified.', value.entity.target.url);
   }
