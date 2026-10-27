@@ -92,9 +92,11 @@ export function reconcilePlaylist(actual: string[], desired: string[], confirmed
 export class Worker {
   private timer?: ReturnType<typeof setInterval>;
   private busy = false;
+  private runningJobId?: string;
   private closed = false;
   constructor(private readonly store: Store, private readonly getProvider: () => Promise<MusicProvider>, private readonly spotify?: SpotifyAdapter) {}
   get isBusy() { return this.busy; }
+  get activeJobId() { return this.runningJobId; }
   start() {
     this.store.run("UPDATE jobs SET status='paused',message='Interrupted by a server restart. Resume to reconcile and continue.' WHERE status='running'");
     this.timer = setInterval(() => { void this.tick(); }, 1000);
@@ -119,7 +121,7 @@ export class Worker {
   async tick() {
     if (this.busy || this.closed) return;
     const row = this.store.get("SELECT * FROM jobs WHERE status='queued' AND COALESCE(json_extract(payload,'$.nextCheck'),0)<=? ORDER BY created LIMIT 1", Date.now()); if (!row) return;
-    this.busy = true; this.store.updateJob(row.id, 'running', 'Working…');
+    this.busy = true; this.runningJobId = row.id; this.store.updateJob(row.id, 'running', 'Working…');
     try {
       if (row.kind === 'spotify_import') {
         if (!this.spotify) throw new Error('Spotify integration is unavailable.');
@@ -166,7 +168,7 @@ export class Worker {
         return;
       }
       this.store.updateJob(row.id, error instanceof ReviewRequired ? 'needs_review' : error instanceof ProviderError ? 'paused' : 'failed', error instanceof ProviderError || error instanceof ReviewRequired ? error.message : 'The job could not finish. Check connection settings and resume.');
-    } finally { this.busy = false; }
+    } finally { this.runningJobId = undefined; this.busy = false; }
   }
   private async match(jobId: string, step: any, provider: MusicProvider) {
     const entity = this.store.getEntity(step.source_id);

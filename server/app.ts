@@ -18,6 +18,7 @@ import { importUpload } from './importer.js';
 import { YouTubeAdapter, YouTubeFactory, YouTubeSessionError, ProviderError, ReviewRequired, type MusicProvider, type YouTubeCredentials } from './youtube.js';
 import { SpotifyAdapter } from './spotify.js';
 import { Worker, queueTransfer, selectedEntities } from './worker.js';
+import { skipFailedTransferSteps } from './job-actions.js';
 import type { TransferSelection } from '../shared/types.js';
 
 const selectionSchema = z.object({ collectionIds: z.array(z.string()).max(10000), likes: z.boolean(), songs: z.boolean(), albums: z.boolean(), artists: z.boolean(), favoriteIds: z.array(z.string()).max(200) });
@@ -195,9 +196,13 @@ export async function createApp(options: { dataDir?: string; providerFactory?: (
   app.get('/api/jobs', { schema: { tags: ['Transfers'], summary: 'List persisted jobs' } }, async request => {
     const p = pagination(request.query); return { items: store.all('SELECT * FROM jobs ORDER BY created DESC LIMIT ? OFFSET ?', p.pageSize, p.offset).map(row => store.jobView(row)), total: store.get('SELECT COUNT(*) n FROM jobs')!.n, page: p.page, pageSize: p.pageSize };
   });
-  app.post('/api/jobs/:id/:action', { schema: { tags: ['Transfers'], summary: 'Pause, resume, cancel, or retry failed job steps' } }, async request => {
-    const { id, action } = z.object({ id: z.string(), action: z.enum(['pause', 'resume', 'cancel', 'retry']) }).parse(request.params);
+  app.post('/api/jobs/:id/:action', { schema: { tags: ['Transfers'], summary: 'Pause, resume, cancel, retry, or skip failed and dependent transfer steps' } }, async request => {
+    const { id, action } = z.object({ id: z.string(), action: z.enum(['pause', 'resume', 'cancel', 'retry', 'skip-failed']) }).parse(request.params);
     const job = store.getJob(id); if (!job) throw fail('Job not found.', 404);
+    if (action === 'skip-failed') {
+      if (worker.activeJobId === id) throw fail('The current action is still stopping. Try Skip failed again in a moment.', 409);
+      return skipFailedTransferSteps(store, id);
+    }
     if (action === 'pause') { if (['queued', 'running'].includes(job.status)) store.updateJob(id, 'paused', 'Paused by owner.'); }
     else if (action === 'cancel') { if (!['completed', 'completed_with_issues', 'cancelled'].includes(job.status)) store.updateJob(id, 'cancelled', 'Cancelled. Already transferred music remains in YouTube Music.'); }
     else {

@@ -290,3 +290,5 @@
 }
 .local-pill.reconnecting { color: #e1c58c; }
 .local-pill.reconnecting > span { background: #e1c58c; }
+.job-footer { flex-wrap: wrap; }
+.job-footer > div { flex-wrap: wrap; justify-content: flex-end; }
